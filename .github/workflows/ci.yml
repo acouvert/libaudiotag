@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build library and samples
+        run: make all CC=gcc
+
+      - name: Build and run tests
+        run: make test CC=gcc
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR / push branch
+        uses: actions/checkout@v4
+        with:
+          path: pr
+
+      - name: Checkout base branch
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+
+      - name: Run coverage (PR branch)
+        run: |
+          set -o pipefail
+          make -C pr coverage CC=gcc 2>&1 | tee /tmp/pr-cov.txt
+          PR_TOTAL=$(grep -E "^\s+total\s" /tmp/pr-cov.txt | grep -oE "[0-9]+\.[0-9]+" | head -1)
+          echo "PR_COVERAGE=${PR_TOTAL:-0}" >> "$GITHUB_ENV"
+
+      - name: Run coverage (base branch)
+        if: github.event_name == 'pull_request'
+        run: |
+          set -o pipefail
+          make -C base coverage CC=gcc 2>&1 | tee /tmp/base-cov.txt
+          BASE_TOTAL=$(grep -E "^\s+total\s" /tmp/base-cov.txt | grep -oE "[0-9]+\.[0-9]+" | head -1)
+          echo "BASE_COVERAGE=${BASE_TOTAL:-0}" >> "$GITHUB_ENV"
+
+      - name: Check coverage regression
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Coverage: base=${BASE_COVERAGE}%  →  PR=${PR_COVERAGE}%"
+          if awk "BEGIN { exit (${PR_COVERAGE:-0}+0 < ${BASE_COVERAGE:-0}+0) ? 0 : 1 }"; then
+            echo "::warning::Coverage decreased from ${BASE_COVERAGE}% to ${PR_COVERAGE}%"
+          fi
