@@ -1,6 +1,7 @@
 #include "mp3_metadata.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -303,6 +304,74 @@ static int parse_id3v2_frames(
     return found_any ? 0 : -1;
 }
 
+// -------- MPEG audio frame / Xing-Info duration --------
+
+// Layer III bitrate tables (kbps) indexed by the 4-bit bitrate field.
+static const int br_v1_l3[16] = { 0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0 };
+static const int br_v2_l3[16] = { 0, 8,16,24,32,40,48,56,64, 80, 96,112,128,144,160,0 };
+static const int sample_rates[3][4] = {
+    { 44100, 48000, 32000, 0 }, // MPEG1
+    { 22050, 24000, 16000, 0 }, // MPEG2
+    { 11025, 12000,  8000, 0 }, // MPEG2.5
+};
+
+// Compute duration (ms) from the Xing/Info VBR header of the first MPEG frame,
+// or fall back to a CBR estimate. Emits a "duration" tag; returns true on success.
+static bool emit_mp3_duration(
+    AudioStream* stream,
+    size_t       first_frame,
+    void*        ctx,
+    tag_found_cb cb)
+{
+    uint8_t hdr[4];
+    if (audio_stream_read(stream, first_frame, 4, hdr) != 0)
+    {
+        return false;
+    }
+
+    if (hdr[0] != 0xFF || (hdr[1] & 0xE0) != 0xE0)
+    {
+        return false;
+    }
+
+    int version_bits = (hdr[1] >> 3) & 0x3; // 0=2.5, 2=2, 3=1
+    int layer_bits    = (hdr[1] >> 1) & 0x3; // 1=III
+    int bitrate_idx   = (hdr[2] >> 4) & 0xF;
+    int sr_idx        = (hdr[2] >> 2) & 0x3;
+    int mono          = ((hdr[3] >> 6) & 0x3) == 3;
+
+    if (version_bits == 1 || layer_bits != 1 || sr_idx == 3 ||
+        bitrate_idx == 0 || bitrate_idx == 15)
+    {
+        return false;
+    }
+
+    int is_mpeg1 = (version_bits == 3);
+    int sr_table = is_mpeg1 ? 0 : (version_bits == 2 ? 1 : 2);
+    int sample_rate = sample_rates[sr_table][sr_idx];
+    int samples_per_frame = is_mpeg1 ? 1152 : 576;
+
+    // Xing/Info tag sits at a fixed offset after the frame header.
+    size_t xing_off = first_frame + 4 + (is_mpeg1 ? (mono ? 17 : 32) : (mono ? 9 : 17));
+    uint8_t xing[12];
+    if (audio_stream_read(stream, xing_off, 12, xing) == 0 &&
+        (memcmp(xing, "Xing", 4) == 0 || memcmp(xing, "Info", 4) == 0))
+    {
+        uint32_t flags = be32(&xing[4]);
+        if (flags & 0x1) // frame-count present
+        {
+            uint32_t frames = be32(&xing[8]);
+            uint64_t duration_ms = (uint64_t)frames * samples_per_frame * 1000 / sample_rate;
+            char out[32];
+            snprintf(out, sizeof(out), "%llu", (unsigned long long)duration_ms);
+            cb(ctx, "duration", out);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // -------- public API --------
 
 int mp3_read_metadata(
@@ -321,5 +390,11 @@ int mp3_read_metadata(
         return -1;
     }
 
-    return parse_id3v2_frames(stream, &id3v2, callback_ctx, callback);
+    int frames_ok = parse_id3v2_frames(stream, &id3v2, callback_ctx, callback);
+
+    // First MPEG audio frame begins right after the ID3v2 tag (and footer, if any).
+    size_t first_frame = 10 + id3v2.size + ((id3v2.flags & 0x10) ? 10 : 0);
+    bool duration_ok = emit_mp3_duration(stream, first_frame, callback_ctx, callback);
+
+    return (frames_ok == 0 || duration_ok) ? 0 : -1;
 }
