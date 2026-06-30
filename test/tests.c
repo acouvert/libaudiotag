@@ -13,6 +13,7 @@
 #include "audio_stream.h"
 #include "flac_metadata.h"
 #include "mp3_metadata.h"
+#include "mp4_metadata.h"
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -243,6 +244,98 @@ static size_t build_id3v2(uint8_t* buf, size_t bufsize,
 
     uint32_t tag_body_size = (uint32_t)(p - frames_start);
     put_syncsafe32(size_pos, tag_body_size);
+
+    return (size_t)(p - buf);
+}
+
+/* ------------------------------------------------------------------ */
+/*  MP4 helpers: build minimal valid MP4/M4A data in a buffer          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Build a minimal MP4/M4A stream:
+ *   ftyp + moov( mvhd + udta( meta( ilst( <items> ) ) ) )
+ *
+ * Each item carries a single `data` atom holding a UTF-8 text value.
+ *
+ * timescale / duration : feed the mvhd duration calculation (ms)
+ * atoms                : array of 4-char ilst atom names (e.g. "\xA9" "nam")
+ * values               : array of corresponding UTF-8 values
+ * num_tags             : length of the atoms/values arrays
+ * Returns total size written.
+ */
+static size_t build_mp4(uint8_t* buf, size_t bufsize,
+                         uint32_t timescale, uint32_t duration,
+                         const char** atoms, const char** values, int num_tags)
+{
+    (void)bufsize;
+    uint8_t* p = buf;
+
+    /* ftyp box */
+    uint8_t* ftyp = p;
+    put_be32(p, 0); p += 4;            /* size placeholder */
+    memcpy(p, "ftyp", 4); p += 4;
+    memcpy(p, "M4A ", 4); p += 4;      /* major brand */
+    put_be32(p, 0); p += 4;            /* minor version */
+    memcpy(p, "M4A ", 4); p += 4;      /* compatible brand */
+    put_be32(ftyp, (uint32_t)(p - ftyp));
+
+    /* moov box */
+    uint8_t* moov = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "moov", 4); p += 4;
+
+    /* mvhd box (version 0) */
+    uint8_t* mvhd = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "mvhd", 4); p += 4;
+    *p++ = 0;                          /* version */
+    *p++ = 0; *p++ = 0; *p++ = 0;      /* flags */
+    put_be32(p, 0); p += 4;            /* creation time */
+    put_be32(p, 0); p += 4;            /* modification time */
+    put_be32(p, timescale); p += 4;
+    put_be32(p, duration); p += 4;
+    put_be32(mvhd, (uint32_t)(p - mvhd));
+
+    /* udta box */
+    uint8_t* udta = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "udta", 4); p += 4;
+
+    /* meta box (FullBox: 4-byte version/flags before children) */
+    uint8_t* meta = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "meta", 4); p += 4;
+    *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;
+
+    /* ilst box */
+    uint8_t* ilst = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "ilst", 4); p += 4;
+
+    for (int i = 0; i < num_tags; i++)
+    {
+        uint8_t* item = p;
+        put_be32(p, 0); p += 4;
+        memcpy(p, atoms[i], 4); p += 4;
+
+        /* data atom: type 1 = UTF-8 text */
+        uint8_t* data = p;
+        put_be32(p, 0); p += 4;
+        memcpy(p, "data", 4); p += 4;
+        put_be32(p, 1); p += 4;        /* version(0) + well-known type(1) */
+        put_be32(p, 0); p += 4;        /* locale */
+        uint32_t vlen = (uint32_t)strlen(values[i]);
+        memcpy(p, values[i], vlen); p += vlen;
+        put_be32(data, (uint32_t)(p - data));
+
+        put_be32(item, (uint32_t)(p - item));
+    }
+
+    put_be32(ilst, (uint32_t)(p - ilst));
+    put_be32(meta, (uint32_t)(p - meta));
+    put_be32(udta, (uint32_t)(p - udta));
+    put_be32(moov, (uint32_t)(p - moov));
 
     return (size_t)(p - buf);
 }
@@ -1220,6 +1313,308 @@ static int test_mp3_io_error_on_ext_header(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Tests: MP4 / M4A with synthetic data                               */
+/* ------------------------------------------------------------------ */
+
+static int test_mp4_basic_tags(void)
+{
+    const char* atoms[]  = { "\xA9" "nam", "\xA9" "ART", "\xA9" "alb", "aART" };
+    const char* vals[]   = { "Song Title", "Song Artist", "Song Album", "Album Artist" };
+    uint8_t buf[1024];
+    size_t len = build_mp4(buf, sizeof(buf), 44100, 44100, atoms, vals, 4);
+
+    MemStream m = mem_stream_create(buf, len);
+    TagBag bag = {0};
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, &bag, collect_tag), 0);
+
+    ASSERT_EQ_STR(tag_bag_get(&bag, "title"), "Song Title");
+    ASSERT_EQ_STR(tag_bag_get(&bag, "artist"), "Song Artist");
+    ASSERT_EQ_STR(tag_bag_get(&bag, "album"), "Song Album");
+    ASSERT_EQ_STR(tag_bag_get(&bag, "albumartist"), "Album Artist");
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
+static int test_mp4_date_and_genre(void)
+{
+    const char* atoms[] = { "\xA9" "day", "\xA9" "gen" };
+    const char* vals[]  = { "2024", "Hip-Hop" };
+    uint8_t buf[512];
+    size_t len = build_mp4(buf, sizeof(buf), 44100, 44100, atoms, vals, 2);
+
+    MemStream m = mem_stream_create(buf, len);
+    TagBag bag = {0};
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, &bag, collect_tag), 0);
+    ASSERT_EQ_STR(tag_bag_get(&bag, "date"), "2024");
+    ASSERT_EQ_STR(tag_bag_get(&bag, "genre"), "Hip-Hop");
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
+static int test_mp4_duration(void)
+{
+    /* timescale 44100, duration 132300 ticks = exactly 3000 ms */
+    const char* atoms[] = { "\xA9" "nam" };
+    const char* vals[]  = { "dur" };
+    uint8_t buf[512];
+    size_t len = build_mp4(buf, sizeof(buf), 44100, 132300, atoms, vals, 1);
+
+    MemStream m = mem_stream_create(buf, len);
+    TagBag bag = {0};
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, &bag, collect_tag), 0);
+    ASSERT_EQ_STR(tag_bag_get(&bag, "duration"), "3000");
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
+static int test_mp4_zero_timescale(void)
+{
+    /* timescale 0 -> no duration tag, but the title tag still succeeds */
+    const char* atoms[] = { "\xA9" "nam" };
+    const char* vals[]  = { "notime" };
+    uint8_t buf[512];
+    size_t len = build_mp4(buf, sizeof(buf), 0, 132300, atoms, vals, 1);
+
+    MemStream m = mem_stream_create(buf, len);
+    TagBag bag = {0};
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, &bag, collect_tag), 0);
+    ASSERT_NULL(tag_bag_get(&bag, "duration"));
+    ASSERT_EQ_STR(tag_bag_get(&bag, "title"), "notime");
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
+static int test_mp4_tracknumber(void)
+{
+    /* trkn carries a binary record: 2 reserved, u16 track, u16 total, 2 reserved */
+    uint8_t buf[512];
+    uint8_t* p = buf;
+
+    uint8_t* ftyp = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "ftyp", 4); p += 4;
+    memcpy(p, "M4A ", 4); p += 4;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "M4A ", 4); p += 4;
+    put_be32(ftyp, (uint32_t)(p - ftyp));
+
+    uint8_t* moov = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "moov", 4); p += 4;
+
+    uint8_t* udta = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "udta", 4); p += 4;
+
+    uint8_t* meta = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "meta", 4); p += 4;
+    *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;
+
+    uint8_t* ilst = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "ilst", 4); p += 4;
+
+    uint8_t* item = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "trkn", 4); p += 4;
+
+    uint8_t* data = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "data", 4); p += 4;
+    put_be32(p, 0); p += 4;   /* type 0 (binary) */
+    put_be32(p, 0); p += 4;   /* locale */
+    put_be16(p, 0); p += 2;   /* reserved */
+    put_be16(p, 7); p += 2;   /* track number = 7 */
+    put_be16(p, 12); p += 2;  /* total tracks = 12 */
+    put_be16(p, 0); p += 2;   /* reserved */
+    put_be32(data, (uint32_t)(p - data));
+    put_be32(item, (uint32_t)(p - item));
+
+    put_be32(ilst, (uint32_t)(p - ilst));
+    put_be32(meta, (uint32_t)(p - meta));
+    put_be32(udta, (uint32_t)(p - udta));
+    put_be32(moov, (uint32_t)(p - moov));
+
+    MemStream m = mem_stream_create(buf, (size_t)(p - buf));
+    TagBag bag = {0};
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, &bag, collect_tag), 0);
+    ASSERT_EQ_STR(tag_bag_get(&bag, "tracknumber"), "7");
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
+static int test_mp4_duration_64bit(void)
+{
+    /* mvhd version 1 uses 64-bit creation/modification/duration fields */
+    uint8_t buf[512];
+    uint8_t* p = buf;
+
+    uint8_t* ftyp = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "ftyp", 4); p += 4;
+    memcpy(p, "M4A ", 4); p += 4;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "M4A ", 4); p += 4;
+    put_be32(ftyp, (uint32_t)(p - ftyp));
+
+    uint8_t* moov = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "moov", 4); p += 4;
+
+    uint8_t* mvhd = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "mvhd", 4); p += 4;
+    *p++ = 1;                      /* version 1 */
+    *p++ = 0; *p++ = 0; *p++ = 0;  /* flags */
+    put_be32(p, 0); p += 4; put_be32(p, 0); p += 4; /* creation (8) */
+    put_be32(p, 0); p += 4; put_be32(p, 0); p += 4; /* modification (8) */
+    put_be32(p, 48000); p += 4;                      /* timescale */
+    put_be32(p, 0); p += 4; put_be32(p, 96000); p += 4; /* duration (8) = 96000 ticks */
+    put_be32(mvhd, (uint32_t)(p - mvhd));
+
+    put_be32(moov, (uint32_t)(p - moov));
+
+    MemStream m = mem_stream_create(buf, (size_t)(p - buf));
+    TagBag bag = {0};
+    /* 96000 / 48000 = 2000 ms */
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, &bag, collect_tag), 0);
+    ASSERT_EQ_STR(tag_bag_get(&bag, "duration"), "2000");
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
+static int test_mp4_bad_magic(void)
+{
+    /* No ftyp box -> not an MP4 */
+    uint8_t buf[16] = { 0, 0, 0, 8, 'm', 'o', 'o', 'v', 0, 0, 0, 0, 0, 0, 0, 0 };
+    MemStream m = mem_stream_create(buf, sizeof(buf));
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, NULL, collect_tag), -1);
+    return 0;
+}
+
+static int test_mp4_no_moov(void)
+{
+    /* Valid ftyp but no moov box -> failure */
+    uint8_t buf[16];
+    uint8_t* p = buf;
+    put_be32(p, 16); p += 4;
+    memcpy(p, "ftyp", 4); p += 4;
+    memcpy(p, "M4A ", 4); p += 4;
+    put_be32(p, 0); p += 4;
+
+    MemStream m = mem_stream_create(buf, 16);
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, NULL, collect_tag), -1);
+    return 0;
+}
+
+static int test_mp4_no_recognized_tags(void)
+{
+    /* moov present but no mvhd and only an unknown ilst atom -> failure */
+    uint8_t buf[512];
+    uint8_t* p = buf;
+
+    uint8_t* ftyp = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "ftyp", 4); p += 4;
+    memcpy(p, "M4A ", 4); p += 4;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "M4A ", 4); p += 4;
+    put_be32(ftyp, (uint32_t)(p - ftyp));
+
+    uint8_t* moov = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "moov", 4); p += 4;
+
+    uint8_t* udta = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "udta", 4); p += 4;
+
+    uint8_t* meta = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "meta", 4); p += 4;
+    *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;
+
+    uint8_t* ilst = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "ilst", 4); p += 4;
+
+    uint8_t* item = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "zzzz", 4); p += 4;   /* unknown atom */
+    uint8_t* data = p;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "data", 4); p += 4;
+    put_be32(p, 1); p += 4;
+    put_be32(p, 0); p += 4;
+    memcpy(p, "x", 1); p += 1;
+    put_be32(data, (uint32_t)(p - data));
+    put_be32(item, (uint32_t)(p - item));
+
+    put_be32(ilst, (uint32_t)(p - ilst));
+    put_be32(meta, (uint32_t)(p - meta));
+    put_be32(udta, (uint32_t)(p - udta));
+    put_be32(moov, (uint32_t)(p - moov));
+
+    MemStream m = mem_stream_create(buf, (size_t)(p - buf));
+    TagBag bag = {0};
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, &bag, collect_tag), -1);
+    ASSERT_EQ_INT(bag.count, 0);
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
+static int test_mp4_large_text_value(void)
+{
+    /* Value > 512 bytes to exercise the malloc fallback in emit_data_atom */
+    char big_value[600];
+    memset(big_value, 'A', sizeof(big_value) - 1);
+    big_value[sizeof(big_value) - 1] = '\0';
+
+    const char* atoms[] = { "\xA9" "nam" };
+    const char* vals[]  = { big_value };
+    uint8_t buf[1024];
+    size_t len = build_mp4(buf, sizeof(buf), 44100, 44100, atoms, vals, 1);
+
+    MemStream m = mem_stream_create(buf, len);
+    TagBag bag = {0};
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, &bag, collect_tag), 0);
+    ASSERT_EQ_STR(tag_bag_get(&bag, "title"), big_value);
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
+static int test_mp4_null_inputs(void)
+{
+    uint8_t dummy = 0;
+    MemStream m = mem_stream_create(&dummy, 1);
+    ASSERT_EQ_INT(mp4_read_metadata(NULL, NULL, collect_tag), -1);
+    ASSERT_EQ_INT(mp4_read_metadata(&m.base, NULL, NULL), -1);
+    return 0;
+}
+
+static int test_mp4_io_error(void)
+{
+    /* Stream that fails on the very first read (ftyp header) */
+    const char* atoms[] = { "\xA9" "nam" };
+    const char* vals[]  = { "x" };
+    uint8_t buf[512];
+    size_t len = build_mp4(buf, sizeof(buf), 44100, 44100, atoms, vals, 1);
+
+    FailStream fs = fail_stream_create(buf, len, 0);
+    ASSERT_EQ_INT(mp4_read_metadata(&fs.base, NULL, collect_tag), -1);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Tests: auto-detect (audio_stream_read_metadata)                    */
 /* ------------------------------------------------------------------ */
 
@@ -1249,6 +1644,22 @@ static int test_autodetect_mp3(void)
     TagBag bag = {0};
     ASSERT_EQ_INT(audio_stream_read_metadata(&m.base, &bag, collect_tag), 0);
     ASSERT_EQ_STR(tag_bag_get(&bag, "title"), "Auto MP3");
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
+static int test_autodetect_mp4(void)
+{
+    const char* atoms[] = { "\xA9" "nam" };
+    const char* vals[]  = { "Auto MP4" };
+    uint8_t buf[512];
+    size_t len = build_mp4(buf, sizeof(buf), 44100, 44100, atoms, vals, 1);
+
+    MemStream m = mem_stream_create(buf, len);
+    TagBag bag = {0};
+    ASSERT_EQ_INT(audio_stream_read_metadata(&m.base, &bag, collect_tag), 0);
+    ASSERT_EQ_STR(tag_bag_get(&bag, "title"), "Auto MP4");
 
     tag_bag_free(&bag);
     return 0;
@@ -1321,9 +1732,24 @@ int main(void)
     RUN_TEST(test_mp3_utf8_trailing_nuls);
     RUN_TEST(test_mp3_io_error_on_ext_header);
 
+    /* MP4 / M4A */
+    RUN_TEST(test_mp4_basic_tags);
+    RUN_TEST(test_mp4_date_and_genre);
+    RUN_TEST(test_mp4_duration);
+    RUN_TEST(test_mp4_zero_timescale);
+    RUN_TEST(test_mp4_tracknumber);
+    RUN_TEST(test_mp4_duration_64bit);
+    RUN_TEST(test_mp4_bad_magic);
+    RUN_TEST(test_mp4_no_moov);
+    RUN_TEST(test_mp4_no_recognized_tags);
+    RUN_TEST(test_mp4_large_text_value);
+    RUN_TEST(test_mp4_null_inputs);
+    RUN_TEST(test_mp4_io_error);
+
     /* Auto-detect */
     RUN_TEST(test_autodetect_flac);
     RUN_TEST(test_autodetect_mp3);
+    RUN_TEST(test_autodetect_mp4);
 
     fprintf(stderr, "  %-50s%s\n", "---", "--");
     fprintf(stderr, "  %d passed, %d failed\n\n", passed, failed);
