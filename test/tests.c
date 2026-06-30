@@ -776,6 +776,35 @@ static int test_mp3_duration_frame(void)
     return 0;
 }
 
+static int test_mp3_xing_duration(void)
+{
+    /* ID3v2 tag (title) + one MPEG1 Layer III stereo frame carrying a Xing
+       header with a frame count -> duration computed from frames/sample-rate. */
+    const char* ids[]  = { "TIT2" };
+    const char* vals[] = { "x" };
+    uint8_t buf[512];
+    size_t tag_len = build_id3v2(buf, sizeof(buf), ids, vals, 1);
+
+    uint8_t* f = buf + tag_len;
+    /* MPEG1 L3 stereo frame header: FF FB 90 00 */
+    f[0] = 0xFF; f[1] = 0xFB; f[2] = 0x90; f[3] = 0x00;
+    /* Xing is 32 bytes into the frame data (MPEG1 stereo) */
+    uint8_t* x = f + 4 + 32;
+    memcpy(x, "Xing", 4);
+    put_be32(x + 4, 0x1);   /* flags: frame-count present */
+    put_be32(x + 8, 1000);  /* 1000 frames */
+
+    size_t total = tag_len + 4 + 32 + 12;
+    MemStream m = mem_stream_create(buf, total);
+    TagBag bag = {0};
+    ASSERT_EQ_INT(mp3_read_metadata(&m.base, &bag, collect_tag), 0);
+    /* 1000 * 1152 * 1000 / 44100 = 26122 ms */
+    ASSERT_EQ_STR(tag_bag_get(&bag, "duration"), "26122");
+
+    tag_bag_free(&bag);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Tests: MP3 text encodings                                          */
 /* ------------------------------------------------------------------ */
@@ -1274,6 +1303,7 @@ int main(void)
     RUN_TEST(test_mp3_bad_magic);
     RUN_TEST(test_mp3_no_recognized_frames);
     RUN_TEST(test_mp3_duration_frame);
+    RUN_TEST(test_mp3_xing_duration);
     RUN_TEST(test_mp3_encoding_latin1);
     RUN_TEST(test_mp3_encoding_utf16_bom);
     RUN_TEST(test_mp3_encoding_utf16be);
