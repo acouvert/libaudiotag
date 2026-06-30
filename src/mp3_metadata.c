@@ -307,8 +307,6 @@ static int parse_id3v2_frames(
 // -------- MPEG audio frame / Xing-Info duration --------
 
 // Layer III bitrate tables (kbps) indexed by the 4-bit bitrate field.
-static const int br_v1_l3[16] = { 0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0 };
-static const int br_v2_l3[16] = { 0, 8,16,24,32,40,48,56,64, 80, 96,112,128,144,160,0 };
 static const int sample_rates[3][4] = {
     { 44100, 48000, 32000, 0 }, // MPEG1
     { 22050, 24000, 16000, 0 }, // MPEG2
